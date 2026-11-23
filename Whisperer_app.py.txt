@@ -1,0 +1,874 @@
+#-------------------------------------------------------
+# Package Installation
+#-------------------------------------------------------
+import hashlib
+import logging
+import os
+import re
+
+import faiss
+import streamlit as st
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
+
+# Used by the user interface section only
+import html
+import numpy as np
+from PIL import Image, ImageDraw
+
+
+#-------------------------------------------------------
+# Configuration
+#-------------------------------------------------------
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.5-flash-lite"
+)
+
+
+@st.cache_resource
+def create_gemini_client():
+    return genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=5)
+        )
+    )
+
+
+#=======================================================
+# INGESTION & INDEXING
+#=======================================================
+
+#-------------------------------------------------------
+# PDF Content Processing
+# (Data Loading & Preprocessing)
+#-------------------------------------------------------
+def extract_pages_from_pdf(pdf_file):
+    pdf_reader = PdfReader(pdf_file)
+    pages = []
+
+    for page_number, page in enumerate(
+        pdf_reader.pages,
+        start=1
+    ):
+        page_text = page.extract_text()
+
+        if page_text and page_text.strip():
+            pages.append(
+                {
+                    "page": page_number,
+                    "text": page_text
+                }
+            )
+
+    return pages, len(pdf_reader.pages)
+
+
+#-------------------------------------------------------
+# Text Processing and Chunk Creation
+# (Chunking, with page and section tracking)
+#-------------------------------------------------------
+# A numbered heading such as "4. Carry Forward and Encashment"
+# or "4.1 Leave Policy"
+SECTION_HEADING_PATTERN = re.compile(
+    r"^(?:(\d{1,2}(?:\.\d+)*)[.)]|(\d{1,2}(?:\.\d+)+))\s+"
+    r"([A-Z][^\n]{2,80})$"
+)
+
+
+def detect_section_heading(line):
+    match = SECTION_HEADING_PATTERN.match(line.strip())
+
+    if not match:
+        return None
+
+    section_number = match.group(1) or match.group(2)
+    section_title = match.group(3).strip()
+
+    # Headings are short and do not end like a sentence
+    if section_title.endswith((".", ":", ",", ";")):
+        return None
+
+    if len(section_title.split()) > 10:
+        return None
+
+    return section_number, section_title
+
+
+def build_sections(pages):
+    # Group the words of the document by section,
+    # remembering the page each word came from.
+    sections = []
+
+    current_section = {
+        "number": None,
+        "title": None,
+        "words": []
+    }
+
+    for page in pages:
+        for line in page["text"].splitlines():
+            heading = detect_section_heading(line)
+
+            if heading:
+                if current_section["words"]:
+                    sections.append(current_section)
+
+                current_section = {
+                    "number": heading[0],
+                    "title": heading[1],
+                    "words": []
+                }
+
+            for word in line.split():
+                current_section["words"].append(
+                    (word, page["page"])
+                )
+
+    if current_section["words"]:
+        sections.append(current_section)
+
+    return sections
+
+
+def split_text_into_chunks(
+    pages,
+    chunk_size=180,
+    chunk_overlap=40
+):
+    # Chunks never cross a section boundary, so every chunk
+    # has one section (if the PDF has numbered headings)
+    # and the page number(s) it came from.
+    chunks = []
+
+    step_size = chunk_size - chunk_overlap
+
+    for section in build_sections(pages):
+        words = section["words"]
+
+        for start_index in range(
+            0,
+            len(words),
+            step_size
+        ):
+            end_index = start_index + chunk_size
+
+            chunk_words = words[
+                start_index:end_index
+            ]
+
+            chunk_text = " ".join(
+                word for word, _ in chunk_words
+            )
+
+            if chunk_text.strip():
+                chunks.append(
+                    {
+                        "text": chunk_text,
+                        "pages": sorted(
+                            {page for _, page in chunk_words}
+                        ),
+                        "section_number": section["number"],
+                        "section_title": section["title"]
+                    }
+                )
+
+            if end_index >= len(words):
+                break
+
+    return chunks
+
+
+#-------------------------------------------------------
+# Embedding
+#-------------------------------------------------------
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer(
+        "sentence-transformers/all-MiniLM-L6-v2"
+    )
+
+
+def create_chunk_embeddings(
+    chunks,
+    model
+):
+    chunk_texts = [
+        chunk["text"] for chunk in chunks
+    ]
+
+    embeddings = model.encode_document(
+        chunk_texts,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    return embeddings
+
+
+#-------------------------------------------------------
+# Generate Vector Index
+# (Indexing & Storage)
+#-------------------------------------------------------
+def create_faiss_index(embeddings):
+    embedding_dimension = embeddings.shape[1]
+
+    index = faiss.IndexFlatIP(
+        embedding_dimension
+    )
+
+    index.add(
+        embeddings.astype("float32")
+    )
+
+    return index
+
+
+#=======================================================
+# RETRIEVAL
+#=======================================================
+
+#-------------------------------------------------------
+# Query Embedding
+#-------------------------------------------------------
+def embed_question(
+    question,
+    model
+):
+    question_embedding = model.encode_query(
+        question,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    return (
+        question_embedding
+        .astype("float32")
+        .reshape(1, -1)
+    )
+
+
+#-------------------------------------------------------
+# Similarity Search
+# (Vector search only: no hybrid search or reranking yet)
+#-------------------------------------------------------
+def search_similar_chunks(
+    question_embedding,
+    index,
+    chunks,
+    top_k=3
+):
+    _, indices = index.search(
+        question_embedding,
+        top_k
+    )
+
+    relevant_chunks = []
+
+    for chunk_index in indices[0]:
+        if chunk_index != -1:
+            relevant_chunks.append(
+                chunks[chunk_index]
+            )
+
+    return relevant_chunks
+
+
+def retrieve_relevant_chunks(
+    question,
+    model,
+    index,
+    chunks,
+    top_k=3
+):
+    question_embedding = embed_question(
+        question,
+        model
+    )
+
+    return search_similar_chunks(
+        question_embedding,
+        index,
+        chunks,
+        top_k
+    )
+
+
+#=======================================================
+# AUGMENTATION & GENERATION
+#=======================================================
+
+#-------------------------------------------------------
+# Context & Prompt Construction
+#-------------------------------------------------------
+def format_source_label(chunk):
+    label_parts = []
+    pages = chunk["pages"]
+
+    if pages:
+        if len(pages) == 1:
+            label_parts.append(f"Page {pages[0]}")
+        else:
+            label_parts.append(
+                f"Pages {pages[0]}-{pages[-1]}"
+            )
+
+    if chunk["section_number"]:
+        label_parts.append(
+            f"Section {chunk['section_number']} - "
+            f"{chunk['section_title']}"
+        )
+
+    return ", ".join(label_parts)
+
+
+def build_prompt(
+    question,
+    relevant_chunks
+):
+    context_blocks = []
+
+    for number, chunk in enumerate(
+        relevant_chunks,
+        start=1
+    ):
+        label = format_source_label(chunk)
+
+        header = f"[Passage {number}"
+
+        if label:
+            header += f" | {label}"
+
+        header += "]"
+
+        context_blocks.append(
+            f"{header}\n{chunk['text']}"
+        )
+
+    context = "\n\n".join(
+        context_blocks
+    )
+
+    system_prompt = """
+You are an assistant that answers questions about an uploaded document.
+
+Base every answer strictly on the document excerpts provided to you.
+If those excerpts don't contain the answer, reply exactly:
+"I could not find that information in the document."
+
+Don't draw on anything outside the provided text, and keep your replies
+brief and easy to understand.
+
+Each passage in the context starts with a label such as
+[Passage 1 | Page 2, Section 4 - Carry Forward and Encashment].
+
+After your answer, add one final line that starts with
+"Source:" and gives the page and section of the passage
+or passages you used, exactly as shown in their labels.
+If a label has no page or no section, leave that part out.
+If you could not find the answer, do not add a Source line.
+"""
+
+    user_prompt = f"""
+Document context:
+
+{context}
+
+Question:
+
+{question}
+"""
+
+    return system_prompt, user_prompt
+
+
+#-------------------------------------------------------
+# Generation & Post-Processing
+#-------------------------------------------------------
+def generate_answer(
+    question,
+    relevant_chunks,
+    client,
+    model_name
+):
+    system_prompt, user_prompt = build_prompt(
+        question,
+        relevant_chunks
+    )
+
+    # Temporary errors (such as 503) are retried by the client's
+    # HttpRetryOptions, so there is no second retry loop here.
+    return client.models.generate_content(
+        model=model_name,
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0,
+        ),
+    ).text
+
+
+def format_answer_with_source(answer):
+    # Show the model's final "Source:" line as its own italic line
+    lines = answer.strip().splitlines()
+
+    if lines:
+        source_match = re.match(
+            r"^[\s*_>-]*source[\s*_]*:[\s*_]*(.*?)[\s*_]*$",
+            lines[-1],
+            re.IGNORECASE
+        )
+
+        if source_match and source_match.group(1):
+            body = "\n".join(lines[:-1]).strip()
+            source_text = source_match.group(1)
+
+            return f"{body}\n\n📜 *Source: {source_text}*".strip()
+
+    return answer.strip()
+
+
+#=======================================================
+# USER INTERFACE
+#=======================================================
+
+#-------------------------------------------------------
+# Page Setup and App Startup
+#-------------------------------------------------------
+# set_page_config must be the first Streamlit command that runs,
+# so nothing above this point may call st.* when the script loads.
+st.set_page_config(
+    page_title="The PDF Whisperer",
+    page_icon="📜",
+    layout="wide"
+)
+
+if not GEMINI_API_KEY:
+    st.error(
+        "GEMINI_API_KEY is missing. "
+        "Please add it to the .env file."
+    )
+    st.stop()
+
+gemini_client = create_gemini_client()
+embedding_model = load_embedding_model()
+
+
+#-------------------------------------------------------
+# Session State
+#-------------------------------------------------------
+# Chat history plus the processed PDF,
+# so both tabs can share the same document.
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "file_signature" not in st.session_state:
+    st.session_state.file_signature = None
+
+if "document_name" not in st.session_state:
+    st.session_state.document_name = None
+
+if "document_chunks" not in st.session_state:
+    st.session_state.document_chunks = None
+
+if "faiss_index" not in st.session_state:
+    st.session_state.faiss_index = None
+
+if "page_count" not in st.session_state:
+    st.session_state.page_count = 0
+
+if "load_error" not in st.session_state:
+    st.session_state.load_error = None
+
+
+#-------------------------------------------------------
+# Page Styling (CSS)
+#-------------------------------------------------------
+st.markdown(
+    """
+    <style>
+    /* User messages: avatar and text on the right side */
+    [data-testid="stChatMessage"]:has(.user-msg-marker),
+    [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]),
+    [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+        flex-direction: row-reverse;
+        text-align: right;
+        margin-left: auto;
+        width: fit-content;
+        max-width: 80%;
+    }
+
+    /* Scroll card shown after a PDF is loaded */
+    .scroll-card {
+        display: flex;
+        align-items: center;
+        gap: 0.9rem;
+        padding: 0.8rem 1.1rem;
+        margin-top: 0.5rem;
+        border: 1px solid rgba(128, 128, 128, 0.35);
+        border-radius: 0.8rem;
+    }
+    .scroll-card .scroll-icon {
+        font-size: 2.2rem;
+        line-height: 1;
+    }
+    .scroll-card .scroll-name {
+        font-weight: 600;
+    }
+    .user-msg-marker {
+        display: none;
+    }
+
+    /* Title centred */
+    [data-testid="stHeading"] h1 {
+        text-align: center;
+    }
+
+    /* Reset button on the right of the title row */
+    .st-key-reset_button {
+        display: flex;
+        justify-content: flex-end;
+    }
+
+    /* Tabs: larger left-aligned labels and a thicker underline */
+    [data-baseweb="tab-list"] {
+        gap: 0;
+    }
+    button[data-baseweb="tab"] {
+        padding-left: 0;
+        padding-right: 3.5rem;
+    }
+    button[data-baseweb="tab"] p {
+        font-size: 1.25rem;
+    }
+    [data-baseweb="tab-highlight"],
+    [data-baseweb="tab-border"] {
+        height: 4px;
+    }
+
+    /* "Ask the PDF Whisperer bot" tab */
+    .ask-caption {
+        font-size: 1.25rem;
+        opacity: 0.7;
+        margin: 1.5rem 0 1rem 0;
+    }
+    [data-testid="stChatMessage"] p {
+        font-size: 1.1rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+#-------------------------------------------------------
+# Chat Avatars
+#-------------------------------------------------------
+@st.cache_resource
+def build_user_avatar():
+    # A simple blue user icon: white head and shoulders on a blue circle
+    size = 128
+    image = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+
+    draw.ellipse((0, 0, size - 1, size - 1), fill=(30, 136, 229, 255))
+    draw.ellipse((46, 22, 82, 58), fill=(255, 255, 255, 255))
+    draw.pieslice((28, 80, 100, 152), 180, 360, fill=(255, 255, 255, 255))
+
+    return np.array(image)
+
+
+USER_AVATAR = build_user_avatar()
+BOT_AVATAR = "🗣️"
+
+
+def render_message(role, content):
+    avatar = USER_AVATAR if role == "user" else BOT_AVATAR
+
+    with st.chat_message(role, avatar=avatar):
+        if role == "user":
+            st.markdown(
+                '<span class="user-msg-marker"></span>',
+                unsafe_allow_html=True
+            )
+
+        st.markdown(content)
+
+
+#-------------------------------------------------------
+# Reset Helpers
+#-------------------------------------------------------
+def reset_chat():
+    st.session_state.messages = []
+
+
+def clear_document_state():
+    st.session_state.messages = []
+    st.session_state.file_signature = None
+    st.session_state.document_name = None
+    st.session_state.document_chunks = None
+    st.session_state.faiss_index = None
+    st.session_state.page_count = 0
+    st.session_state.load_error = None
+
+
+#-------------------------------------------------------
+# Page Title and Reset Button
+#-------------------------------------------------------
+_, title_column, reset_column = st.columns(
+    [1, 3, 1],
+    vertical_alignment="center"
+)
+
+with title_column:
+    st.title("The PDF Whisperer")
+
+with reset_column:
+    st.button(
+        "🔄 Reset",
+        on_click=reset_chat,
+        help="Clear the chat history",
+        key="reset_button"
+    )
+
+tab_load, tab_ask = st.tabs(
+    [
+        "Load your PDF scrolls",
+        "Ask the PDF Whisperer bot"
+    ]
+)
+
+
+#-------------------------------------------------------
+# "Load your PDF scrolls" Tab
+#-------------------------------------------------------
+with tab_load:
+    st.write(
+        "Upload the PDF document you want to explore."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Upload",     type=["pdf"],
+        label_visibility="collapsed"
+    )
+
+    if uploaded_file is None:
+        # File was removed, so forget the old document and chat
+        clear_document_state()
+
+    else:
+        file_signature = (
+            uploaded_file.name,
+            hashlib.md5(uploaded_file.getvalue()).hexdigest()
+        )
+
+        # Process the PDF only once per uploaded file
+        if st.session_state.file_signature != file_signature:
+            clear_document_state()
+
+            pages, page_count = [], 0
+            load_error = None
+
+            try:
+                pages, page_count = (
+                    extract_pages_from_pdf(uploaded_file)
+                )
+            except Exception:
+                logging.exception("Could not read the PDF")
+                load_error = (
+                    "This PDF could not be read. It may be "
+                    "encrypted, password-protected or corrupted."
+                )
+
+            if load_error is None and not pages:
+                load_error = (
+                    "No readable text was found in this PDF. "
+                    "It may be scanned or image-based."
+                )
+
+            if load_error:
+                # Remember this file so it is not re-read on every rerun
+                st.session_state.load_error = load_error
+                st.session_state.file_signature = file_signature
+
+            else:
+                document_chunks = split_text_into_chunks(
+                    pages
+                )
+
+                with st.spinner(
+                    "Creating document embeddings..."
+                ):
+                    chunk_embeddings = (
+                        create_chunk_embeddings(
+                            document_chunks,
+                            embedding_model
+                        )
+                    )
+
+                st.session_state.faiss_index = (
+                    create_faiss_index(chunk_embeddings)
+                )
+                st.session_state.document_chunks = document_chunks
+                st.session_state.page_count = page_count
+                st.session_state.document_name = uploaded_file.name
+                st.session_state.file_signature = file_signature
+
+        if st.session_state.load_error:
+            st.error(st.session_state.load_error)
+
+        elif st.session_state.file_signature == file_signature:
+            st.success(
+                "Uploaded Successfully. "
+                "Your PDF is ready to talk now."
+            )
+
+            st.markdown(
+                f"""
+                <div class="scroll-card">
+                    <span class="scroll-icon">📜</span>
+                    <div>
+                        <div class="scroll-name">
+                            {html.escape(st.session_state.document_name)}
+                        </div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            section_count = len(
+                {
+                    chunk["section_number"]
+                    for chunk in st.session_state.document_chunks
+                    if chunk["section_number"]
+                }
+            )
+
+            st.caption(
+                f"{st.session_state.page_count} pages · "
+                f"{len(st.session_state.document_chunks)} chunks · "
+                + (
+                    f"{section_count} numbered sections found"
+                    if section_count
+                    else "no numbered sections found"
+                )
+            )
+
+
+#-------------------------------------------------------
+# "Ask the PDF Whisperer bot" Tab
+#-------------------------------------------------------
+with tab_ask:
+    st.markdown(
+        '<p class="ask-caption">'
+        'What would you like me to uncover in your document?'
+        '</p>',
+        unsafe_allow_html=True
+    )
+
+    if st.session_state.faiss_index is None:
+        st.info(
+            "Upload your PDF in the 'Load your PDF scrolls' "
+            "tab first, then come back to ask your questions."
+        )
+
+    else:
+        # The conversation lives in a container created before the chat
+        # input, so it always renders above the input box
+        # (st.chat_input sits inline when used inside a tab).
+        chat_area = st.container()
+
+        user_question = st.chat_input(
+            "Ask a question about the document"
+        )
+
+        with chat_area:
+            for message in st.session_state.messages:
+                render_message(
+                    message["role"],
+                    message["content"]
+                )
+
+            if user_question:
+                st.session_state.messages.append(
+                    {
+                        "role": "user",
+                        "content": user_question
+                    }
+                )
+
+                render_message("user", user_question)
+
+                relevant_chunks = retrieve_relevant_chunks(
+                    user_question,
+                    embedding_model,
+                    st.session_state.faiss_index,
+                    st.session_state.document_chunks,
+                    top_k=3
+                )
+
+                answer = None
+
+                #-------------------------------------------------------
+                # Exception Handling
+                #-------------------------------------------------------
+                try:
+                    with st.chat_message(
+                        "assistant",
+                        avatar=BOT_AVATAR
+                    ):
+                        with st.spinner(
+                            "Searching the document..."
+                        ):
+                            answer = generate_answer(
+                                user_question,
+                                relevant_chunks,
+                                gemini_client,
+                                GEMINI_MODEL
+                            )
+
+                        # Post-processing: reject empty answers
+                        if not answer or not answer.strip():
+                            st.error(
+                                "The model returned an empty response."
+                            )
+                            answer = None
+                        else:
+                            answer = format_answer_with_source(answer)
+                            st.markdown(answer)
+
+                except Exception as error:
+                    answer = None
+                    logging.exception("Answer generation failed")
+
+                    #st.error(
+                    #    "Unable to generate an answer. "
+                    #    "Please check your API key, model "
+                    #    "configuration, and internet connection."
+                    #  )
+
+                    # Full details go to the server log, not the screen
+                    #st.caption(f"Error type: {type(error).__name__}")
+                    st.error("Gemini API request failed.")
+
+                    st.write("Error type:", type(error).__name__)
+                    st.write("Error details:", str(error))
+                    st.write("Model:", GEMINI_MODEL)
+                    st.write("API key loaded:", bool(GEMINI_API_KEY))
+                
+                
+                if answer:
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": answer
+                        }
+                    )

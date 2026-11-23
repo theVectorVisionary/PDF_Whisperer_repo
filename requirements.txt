@@ -1,0 +1,8 @@
+streamlit
+python-dotenv
+google-genai
+pypdf
+faiss-cpu
+numpy
+pillow
+sentence-transformers>=5.0.0
